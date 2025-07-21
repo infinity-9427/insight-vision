@@ -1,0 +1,420 @@
+# app.py - InsightVision Backend
+import os
+import asyncio
+import json
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+import uuid
+import time
+from functools import wraps
+
+# FastAPI
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, BackgroundTasks, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ValidationError
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# Data Processing
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+import plotly.graph_objects as go
+import plotly.utils
+
+# File Processing
+import aiofiles
+import fitz  # PyMuPDF
+import pdfplumber
+
+# LLM Integration
+import requests
+import google.generativeai as genai
+
+# Utilities
+from dotenv import load_dotenv
+import psutil
+from collections import Counter
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO"))
+log_format = os.getenv("LOG_FORMAT", "detailed")
+
+if log_format == "json":
+    try:
+        import json_logging
+        json_logging.init_fastapi(enable_json=True)
+        json_logging.init_request_instrument()
+    except ImportError:
+        log_format = "detailed"  # Fallback if json_logging not available
+
+logging.basicConfig(
+    level=log_level,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Log PyMuPDF availability
+logger.info("PyMuPDF (fitz) loaded successfully")
+
+# Rate limiting middleware
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, calls_limit: int = 60, period: int = 60):
+        super().__init__(app)
+        self.calls_limit = calls_limit
+        self.period = period
+        self.calls = {}
+
+    async def dispatch(self, request: Request, call_next):
+        if not os.getenv("ENABLE_API_RATE_LIMITING", "true").lower() == "true":
+            return await call_next(request)
+            
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.time()
+        
+        # Clean old entries
+        self.calls = {ip: [(timestamp, count) for timestamp, count in calls 
+                          if now - timestamp < self.period] 
+                     for ip, calls in self.calls.items()}
+        
+        # Check rate limit
+        if client_ip in self.calls:
+            recent_calls = sum(count for _, count in self.calls[client_ip])
+            if recent_calls >= self.calls_limit:
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded"}
+                )
+        
+        # Record this call
+        if client_ip not in self.calls:
+            self.calls[client_ip] = []
+        self.calls[client_ip].append((now, 1))
+        
+        return await call_next(request)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="InsightVision API",
+    description="AI-Powered Data Insight Dashboard",
+    version="1.0.0",
+    docs_url="/docs" if os.getenv("DEBUG", "false").lower() == "true" else None,
+    redoc_url="/redoc" if os.getenv("DEBUG", "false").lower() == "true" else None,
+)
+
+# CORS Configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Create upload directory
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Error handlers
+@app.exception_handler(422)
+async def validation_exception_handler(request, exc):
+    body = await request.body()
+    logger.error(f"422 Validation error on {request.method} {request.url}")
+    logger.error(f"Request body: {body.decode()}")
+    logger.error(f"Content-Type: {request.headers.get('content-type')}")
+    logger.error(f"Error details: {exc}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": str(exc), "error_type": "validation_error", "request_body": body.decode()}
+    )
+
+# Configure Gemini if using cloud model
+if os.getenv("MODEL_SOURCE") == "gemini":
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+# Data Models
+class FileUploadResponse(BaseModel):
+    file_id: str
+    filename: str
+    file_type: str
+    size: int
+    preview: Dict[str, Any]
+
+class AnalysisRequest(BaseModel):
+    file_id: str
+    analysis_type: str = "comprehensive"  # comprehensive, statistical, visual, custom
+    custom_prompt: Optional[str] = None
+
+class AnalysisResponse(BaseModel):
+    analysis_id: str
+    file_id: str
+    insights: Dict[str, Any]
+    charts: List[Dict[str, str]]
+    summary: str
+    recommendations: List[str]
+
+class SystemStatus(BaseModel):
+    status: str
+    model_source: str
+    model_name: str
+    system_resources: Dict[str, Any]
+    available_models: List[str]
+
+# Utility Functions
+def get_system_resources():
+    """Get current system resource usage"""
+    return {
+        "cpu_percent": psutil.cpu_percent(),
+        "memory_percent": psutil.virtual_memory().percent,
+        "disk_percent": psutil.disk_usage('/').percent,
+        "available_memory_gb": round(psutil.virtual_memory().available / (1024**3), 2)
+    }
+
+async def save_uploaded_file(file: UploadFile) -> tuple[str, Path]:
+    """Save uploaded file and return file_id and path"""
+    file_id = str(uuid.uuid4())
+    filename = file.filename or "unknown"
+    file_extension = Path(filename).suffix
+    file_path = UPLOAD_DIR / f"{file_id}{file_extension}"
+    
+    async with aiofiles.open(file_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    return file_id, file_path
+
+def read_csv_file(file_path: Path) -> pd.DataFrame:
+    """Read CSV file with various encodings"""
+    encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
+    for encoding in encodings:
+        try:
+            return pd.read_csv(file_path, encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("Could not read CSV file with any encoding")
+
+def read_excel_file(file_path: Path) -> pd.DataFrame:
+    """Read Excel file"""
+    return pd.read_excel(file_path)
+
+def read_pdf_file(file_path: Path) -> str:
+    """Extract text from PDF file using PyMuPDF"""
+    text = ""
+    try:
+        doc = fitz.open(file_path)
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+    except Exception as e:
+        logger.error(f"Failed to extract PDF text with PyMuPDF: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF processing failed: {str(e)}")
+    return text
+
+def generate_data_preview(df: pd.DataFrame) -> Dict[str, Any]:
+    """Generate a comprehensive data preview"""
+    max_rows = int(os.getenv("MAX_ROWS_PREVIEW", 1000))
+    
+    preview = {
+        "shape": df.shape,
+        "columns": list(df.columns),
+        "dtypes": df.dtypes.astype(str).to_dict(),
+        "head": df.head(10).to_dict(orient="records"),
+        "tail": df.tail(5).to_dict(orient="records"),
+        "missing_values": df.isnull().sum().to_dict(),
+        "numeric_summary": {},
+        "categorical_summary": {}
+    }
+    
+    # Numeric columns summary
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) > 0:
+        preview["numeric_summary"] = df[numeric_cols].describe().to_dict()
+    
+    # Categorical columns summary
+    categorical_cols = df.select_dtypes(include=['object']).columns
+    for col in categorical_cols[:5]:  # Limit to first 5 categorical columns
+        preview["categorical_summary"][col] = {
+            "unique_count": df[col].nunique(),
+            "top_values": df[col].value_counts().head(5).to_dict()
+        }
+    
+    return preview
+
+async def call_local_llm(prompt: str) -> str:
+    """Call local Ollama LLM - bulletproof with fallback"""
+    try:
+        # Try to use Ollama first
+        url = "http://ollama:11434/api/generate"
+        payload = {
+            "model": "llama3.2:1b",
+            "prompt": prompt,
+            "stream": False
+        }
+        
+        logger.info("Attempting Ollama connection...")
+        response = requests.post(url, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            ollama_response = result.get("response", "").strip()
+            if ollama_response:
+                logger.info("Ollama response received successfully")
+                return ollama_response
+        
+        # If Ollama doesn't work or returns empty, return unavailable message
+        logger.info("LLM analysis unavailable - returning professional unavailable message")
+        return """
+        {
+            "key_findings": ["AI analysis unavailable"],
+            "document_summary": "Text extraction completed successfully, but AI analysis is currently unavailable. Please try again later.",
+            "main_topics": ["Service Unavailable"],
+            "recommendations": ["Try again later", "Contact support if issue persists"],
+            "executive_summary": "Document processed, AI analysis unavailable."
+        }
+        """
+        
+    except Exception as e:
+        logger.info(f"LLM processing error: {str(e)} - returning unavailable message")
+        return """
+        {
+            "key_findings": ["AI analysis unavailable due to service error"],
+            "document_summary": "Document uploaded successfully, but AI analysis failed. Service may be temporarily unavailable.",
+            "main_topics": ["Service Error"],
+            "recommendations": ["Try again later", "Contact support if issue persists"],
+            "executive_summary": "Document processed, AI analysis failed."
+        }
+        """
+
+async def call_gemini_llm(prompt: str) -> str:
+    """Call Gemini API"""
+    try:
+        model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        logger.error(f"Error calling Gemini: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Gemini Error: {str(e)}")
+
+async def generate_insights(df: pd.DataFrame, analysis_type: str = "comprehensive", custom_prompt: Optional[str] = None) -> Dict[str, Any]:
+    """Generate AI-powered insights from data"""
+    
+    # Prepare data summary for LLM
+    data_summary = {
+        "shape": df.shape,
+        "columns": list(df.columns),
+        "dtypes": df.dtypes.astype(str).to_dict(),
+        "missing_values": df.isnull().sum().to_dict(),
+        "numeric_summary": df.describe().to_dict() if len(df.select_dtypes(include=[np.number]).columns) > 0 else {},
+        "sample_data": df.head(5).to_dict(orient="records")
+    }
+    
+    # Create analysis prompt
+    if custom_prompt:
+        prompt = f"""
+        Analyze this dataset and provide insights based on the following request:
+        {custom_prompt}
+        
+        Dataset Summary:
+        {json.dumps(data_summary, indent=2)}
+        
+        Please provide a detailed analysis in JSON format with the following structure:
+        {{
+            "key_findings": ["finding1", "finding2", ...],
+            "statistical_insights": ["insight1", "insight2", ...],
+            "patterns_detected": ["pattern1", "pattern2", ...],
+            "data_quality_notes": ["note1", "note2", ...],
+            "recommendations": ["rec1", "rec2", ...],
+            "executive_summary": "Brief summary of main insights"
+        }}
+        """
+    else:
+        prompt = f"""
+        You are a senior data analyst. Analyze this dataset and provide comprehensive insights.
+        
+        Dataset Summary:
+        {json.dumps(data_summary, indent=2)}
+        
+        Provide a detailed analysis in JSON format with:
+        1. Key findings from the data
+        2. Statistical insights and trends
+        3. Patterns or anomalies detected
+        4. Data quality assessment
+        5. Business recommendations
+        6. Executive summary
+        
+        Format your response as valid JSON:
+        {{
+            "key_findings": ["finding1", "finding2", ...],
+            "statistical_insights": ["insight1", "insight2", ...],
+            "patterns_detected": ["pattern1", "pattern2", ...],
+            "data_quality_notes": ["note1", "note2", ...],
+            "recommendations": ["rec1", "rec2", ...],
+            "executive_summary": "Brief summary of main insights"
+        }}
+        """
+    
+    # Call appropriate LLM
+    model_source = os.getenv("MODEL_SOURCE", "local")
+    if model_source == "gemini":
+        response = await call_gemini_llm(prompt)
+    else:
+        response = await call_local_llm(prompt)
+    
+    # Parse LLM response
+    try:
+        # Try to extract JSON from response
+        if "```json" in response:
+            json_str = response.split("```json")[1].split("```")[0].strip()
+        elif "{" in response and "}" in response:
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            json_str = response[start:end]
+        else:
+            json_str = response
+        
+        insights = json.loads(json_str)
+        return insights
+    except json.JSONDecodeError:
+        logger.warning("Could not parse LLM response as JSON, returning raw response")
+        return {
+            "key_findings": ["Analysis completed"],
+            "statistical_insights": [response[:500] + "..." if len(response) > 500 else response],
+            "patterns_detected": ["See statistical insights for details"],
+            "data_quality_notes": ["Manual review recommended"],
+            "recommendations": ["Review the detailed analysis"],
+            "executive_summary": response[:200] + "..." if len(response) > 200 else response
+        }
+
+async def analyze_pdf_comprehensive(text: str, file_id: str, file_path: Path) -> tuple[Dict[str, Any], List[Dict[str, str]]]:
+    """Comprehensive PDF analysis with detailed insights"""
+    
+    # Basic text analytics
+    word_count = len(text.split())
+    sentence_count = text.count('.') + text.count('!') + text.count('?')
+    paragraph_count = text.count('\n\n') + 1
+    
+    # Extract key topics using word frequency
+    import re
+    from collections import Counter
+    
+    # Clean text and get words
+    clean_text = re.sub(r'[^\w\s]', '', text.lower())
+    words = [word for word in clean_text.split() if len(word) > 3]
+    
+    # Get most common words (excluding common stop words)
+    stop_words = {'this', 'that', 'with', 'have', 'will', 'from', 'they', 'been', 'were', 'their', 'said', 'each', 'which', 'what', 'about', 'would', 'there', 'could', 'other', 'after', 'first', 'well', 'many', 'some', 'time', 'very', 'when', 'much', 'new', 'also', 'any', 'may', 'way', 'work', 'part', 'because', 'such', 'even', 'back', 'good', 'how', 'its', 'our', 'out', 'if', 'up', 'use', 'her', 'each', 'which', 'she', 'do', 'get', 'has', 'him', 'his', 'how', 'man', 'new', 'now', 'old', 'see', 'two', 'who', 'its', 'did', 'yes', 'his', 'has', 'had'}
+    filtered_words = [word for word in words if word not in stop_words and len(word) > 4]
+    word_freq = Counter(filtered_words)
+    top_words = word_freq.most_common(10)
+    
+    # Create simple analysis prompt for better JSON output

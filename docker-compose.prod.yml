@@ -1,0 +1,112 @@
+# docker-compose.prod.yml - Production Override
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+services:
+  # Reverse Proxy (Nginx)
+  nginx:
+    image: nginx:alpine
+    container_name: insightvision-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - ./nginx/logs:/var/log/nginx
+    depends_on:
+      - frontend
+      - app
+    restart: unless-stopped
+    networks:
+      - insightvision-network
+
+  # Redis for session management and caching
+  redis:
+    image: redis:7-alpine
+    container_name: insightvision-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - insightvision-network
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '0.5'
+
+  # PostgreSQL Database (production)
+  postgres:
+    image: postgres:15-alpine
+    container_name: insightvision-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-insightvision}
+      POSTGRES_USER: ${POSTGRES_USER:-insightvision}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
+    networks:
+      - insightvision-network
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: '1'
+
+  # Monitoring with Prometheus (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: insightvision-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks:
+      - insightvision-network
+
+  # Log aggregation
+  loki:
+    image: grafana/loki:latest
+    container_name: insightvision-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/tmp/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    restart: unless-stopped
+    networks:
+      - insightvision-network
+
+  # Grafana for monitoring dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: insightvision-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+    networks:
+      - insightvision-network
+
+volumes:
+  redis_data:
+  postgres_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:

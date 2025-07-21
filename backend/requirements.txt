@@ -1,0 +1,61 @@
+# Core Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# HTTP & API
+requests==2.31.0
+httpx==0.25.2
+
+# Data Processing & Analytics
+pandas==2.1.4
+numpy==1.26.0
+openpyxl==3.1.2  # Excel support
+xlrd==2.0.1      # Legacy Excel support
+
+# Data Visualization
+matplotlib==3.8.2
+seaborn==0.13.0
+plotly==5.17.0
+
+# PDF Processing
+# PyMuPDF==1.23.8  # PDF text extraction - installed separately in Dockerfile
+pdfplumber==0.10.3  # Alternative PDF processor
+reportlab==4.0.7  # PDF generation
+
+# File Processing
+python-multipart==0.0.6  # File uploads
+aiofiles==23.2.1
+
+# LLM Integration
+google-generativeai==0.3.2  # Gemini API
+openai==1.3.8  # Optional: OpenAI API
+
+# Database (Optional)
+sqlalchemy==2.0.23
+alembic==1.13.1
+
+# Email (Optional)
+aiosmtplib==3.0.1
+jinja2==3.1.2  # Email templates
+
+# Security & Authentication
+python-jose[cryptography]==3.3.0  # JWT tokens
+bcrypt==4.1.2  # Password hashing
+passlib[bcrypt]==1.7.4  # Password utilities
+
+# Utilities
+python-dotenv==1.0.0
+pillow==10.1.0  # Image processing
+
+# Development & Monitoring
+python-json-logger==2.0.7
+psutil==5.9.6  # System monitoring
+
+# Production Dependencies
+gunicorn==21.2.0  # WSGI server
+slowapi==0.1.9   # Rate limiting
+redis==5.0.1     # Session management (optional)
+
+# Security
+cryptography>=42.0.0
